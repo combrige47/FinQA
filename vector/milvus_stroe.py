@@ -36,8 +36,8 @@ if not client.has_collection(collection_name=COLLECTION_NAME):
     schema.add_field(field_name="report_type", datatype=DataType.VARCHAR, max_length=64)
     schema.add_field(field_name="report_year", datatype=DataType.INT32)
     schema.add_field(field_name="report_date", datatype=DataType.VARCHAR, max_length=20)
-    schema.add_field(field_name="title", datatype=DataType.VARCHAR, max_length=256)
-    schema.add_field(field_name="title_path", datatype=DataType.VARCHAR, max_length=1000)
+    schema.add_field(field_name="title", datatype=DataType.VARCHAR, max_length=1024)
+    schema.add_field(field_name="title_path", datatype=DataType.VARCHAR, max_length=2048)
     schema.add_field(field_name="page_start", datatype=DataType.INT32)
     schema.add_field(field_name="page_end", datatype=DataType.INT32)
     schema.add_field(field_name="text", datatype=DataType.VARCHAR, max_length=65535)
@@ -118,11 +118,52 @@ def insert(file_path:str):
         data=entities
     )
     print(f"数据插入成功！影响行数: {insert_result.get('insert_count')}")
-def batch_insert(input_dir:str):
+    return len(entities)
+
+
+def batch_insert(input_dir: str):
+    from tqdm import tqdm
+    import traceback
+    from datetime import datetime
+
     input_dir_obj = Path(input_dir)
-    md_files = list(input_dir_obj.glob("*.md"))
-    for idx,md_file in enumerate(md_files,1):
-        print(f"当前正在处理第{idx}个文档")
-        insert(md_file)
+    md_files = sorted(input_dir_obj.glob("*.md"))
+    total = len(md_files)
+    failed = []
+    total_chunks = 0
+
+    print(f"共发现 {total} 个 Markdown 文件\n")
+
+    pbar = tqdm(md_files, desc="导入进度", unit="file",
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]")
+
+    for idx, md_file in enumerate(pbar, 1):
+        fname = md_file.name
+        try:
+            chunk_count = insert(str(md_file))
+            total_chunks += chunk_count
+            pbar.set_postfix_str(f"OK {fname[:50]}")
+        except Exception as e:
+            err_msg = f"{type(e).__name__}: {e}"
+            failed.append({"file": fname, "error": err_msg})
+            tqdm.write(f"  [失败] {fname}: {err_msg}")
+
+    pbar.close()
+
+    # 汇总
+    print(f"\n{'='*50}")
+    print(f"导入完成: {total - len(failed)}/{total} 成功, 共 {total_chunks} 个 chunks")
+    if failed:
+        print(f"失败 {len(failed)} 个文件:")
+        for f in failed:
+            print(f"  - {f['file']}")
+            print(f"    {f['error']}")
+
+        # 写入失败日志
+        log_path = input_dir_obj / f"failed_import_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        with open(log_path, "w", encoding="utf-8") as log:
+            for f in failed:
+                log.write(f"{f['file']}\t{f['error']}\n")
+        print(f"失败日志已保存: {log_path}")
 
 batch_insert(input_dir="../parse/test_output")

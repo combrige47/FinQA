@@ -296,8 +296,6 @@ class MarkdownChunker:
 
                 # 构建完整标题路径用于 title 字段和 text 上下文
                 full_title = " > ".join(title_path) if title_path else ""
-                # Milvus title 字段 max_length=256，超出截断
-                display_title = full_title[:250] + "..." if len(full_title) > 256 else full_title
 
                 enriched = self._enrich_chunk_text(p, title_path)
 
@@ -323,7 +321,7 @@ class MarkdownChunker:
 
                     report_date=report_date,
 
-                    title=display_title,
+                    title=full_title,
 
                     title_path=title_path.copy(),
 
