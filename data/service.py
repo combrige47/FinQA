@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from contextlib import asynccontextmanager
 
 MILVUS_URI = "http://124.70.51.221:19530"
-MODEL_PATH = "../model/bge-m3"
+MODEL_PATH = "./model/bge-m3"
 API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 DEFAULT_COLLECTION = "financial_chunk"
 TOP_K = 5
