@@ -1,18 +1,18 @@
 from datetime import date
 from pathlib import Path
+
 from FlagEmbedding import BGEM3FlagModel
 from pymilvus import MilvusClient, DataType
-from transformers import AutoTokenizer
 
 from parse.parse_md import MarkdownChunker
 
 MILVUS_URI = "http://124.70.51.221:19530"
-MODEL_PATH = str(Path(__file__).parent.parent / "model" / "bge-m3")
+MODEL_PATH = "../model/bge-m3"
 model = BGEM3FlagModel(MODEL_PATH, use_fp16=False)
 COLLECTION_NAME = "financial_chunk"
 TOP_K = 5
 CANDIDATE_K = 100
-DENSE_WEIGHT = 0.3
+DENSE_WEIGHT = 0.4
 
 
 client = MilvusClient(uri=MILVUS_URI)
@@ -123,7 +123,6 @@ def insert(file_path:str):
 
 def batch_insert(input_dir: str):
     from tqdm import tqdm
-    import traceback
     from datetime import datetime
 
     input_dir_obj = Path(input_dir)
