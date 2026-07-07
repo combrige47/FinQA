@@ -4,16 +4,14 @@ from pathlib import Path
 from typing import List, Optional
 
 import uvicorn
-from pymilvus import MilvusClient
+from pymilvus import MilvusClient, AnnSearchRequest, WeightedRanker
 from FlagEmbedding import BGEM3FlagModel
 from fastapi import FastAPI, Query
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
 MILVUS_URI = "http://124.70.51.221:19530"
-MODEL_PATH = str(Path(__file__).parent.parent / "model" / "bge-m3")
+MODEL_PATH = "../model/bge-m3"
 DEFAULT_COLLECTION = "financial_chunk"
 TOP_K = 5
 CANDIDATE_K = 100
@@ -54,26 +52,43 @@ app = FastAPI(title="FinQA Hybrid Retriever Service", lifespan=lifespan)
 @app.get("/search")
 async def search(
         query: str = Query(...),
-        top_k: int = TOP_K
+        top_k: int = TOP_K,
+        dense_weight: float = Query(default=DENSE_WEIGHT,
+                                    description="密集检索权重 (0~1)")
 ):
     res = []
 
-    query_vector = model.encode(
+    # 同时生成密集向量和稀疏权重
+    output = model.encode(
         [query],
-        batch_size=1
-    )["dense_vecs"][0].tolist()
+        batch_size=1,
+        return_dense=True,
+        return_sparse=True
+    )
+    dense_vec = output["dense_vecs"][0].tolist()
+    sparse_vec = output["lexical_weights"][0]
 
-    results = client.search(
+    # 混合检索: dense + sparse
+    dense_req = AnnSearchRequest(
+        data=[dense_vec],
+        anns_field="embedding",
+        param={"metric_type": "COSINE", "params": {"ef": CANDIDATE_K}},
+        limit=top_k
+    )
+    sparse_req = AnnSearchRequest(
+        data=[sparse_vec],
+        anns_field="sparse_embedding",
+        param={"metric_type": "IP"},
+        limit=top_k
+    )
+    ranker = WeightedRanker(dense_weight, 1 - dense_weight)
+
+    results = client.hybrid_search(
         collection_name=DEFAULT_COLLECTION,
-        data=[query_vector],
+        reqs=[dense_req, sparse_req],
+        ranker=ranker,
         limit=top_k,
-        output_fields=["text", "chunk_id", "company_name", "doc_id", "report_year", "stock_code", "title"],
-        search_params={
-            "metric_type": "COSINE",
-            "params": {
-                "ef": CANDIDATE_K
-            }
-        }
+        output_fields=["text", "chunk_id", "company_name", "doc_id", "report_year", "stock_code", "title"]
     )
 
     if results:
@@ -92,6 +107,7 @@ async def search(
 
     return {
         "query": query,
+        "dense_weight": dense_weight,
         "results": res
     }
 
