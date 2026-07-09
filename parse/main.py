@@ -1,14 +1,10 @@
 from datetime import date
-from pathlib import Path
 
-from transformers import AutoTokenizer
+from vector.embedding_client import _TiktokenAdapter
 
 from parse.parse_md import MarkdownChunker
-MODEL_PATH = str(Path(__file__).parent.parent / "model" / "bge-m3")
-tokenizer = AutoTokenizer.from_pretrained(
-    MODEL_PATH,
-    trust_remote_code=True
-)
+
+tokenizer = _TiktokenAdapter("cl100k_base")
 with open("../vector/2026-03-31_000488_ST晨鸣_2025年年度报告.md", encoding="utf-8") as f:
     md = f.read()
 
@@ -28,8 +24,7 @@ lengths = []
 for chunk in chunks:
     lengths.append(
         len(tokenizer.encode(
-            chunk.text,
-            add_special_tokens=False
+            chunk.text
         ))
     )
 

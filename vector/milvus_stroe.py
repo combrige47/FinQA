@@ -18,33 +18,21 @@ import sys
 import time
 import traceback
 from dataclasses import dataclass, field
-
-# 抑制 transformers / FlagEmbedding 内部的进度条和警告
-os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
-logging.getLogger("transformers").setLevel(logging.ERROR)
-logging.getLogger("FlagEmbedding").setLevel(logging.ERROR)
 from datetime import date, datetime
 from pathlib import Path
 
-from FlagEmbedding import BGEM3FlagModel
 from pymilvus import MilvusClient, DataType
 
 from parse.parse_md import MarkdownChunker
 from parse.parse_name import extract_report_meta
+from vector.embedding_client import EmbeddingClient
 
 # ── 默认配置 ──
 DEFAULT_MILVUS_URI = "http://124.70.51.221:19530"
 DEFAULT_COLLECTION_NAME = "financial_chunk"
 DEFAULT_INPUT_DIR = "open_output"
+DEFAULT_EMBEDDING_MODEL = "text-embedding-v4"
 
-# 项目根目录 (FinQA/vector/ -> FinQA/ -> project_root)
-_PROJECT_ROOT = Path(__file__).parent.parent.parent
-DEFAULT_MODEL_PATH = str(_PROJECT_ROOT / "models" / "bge-m3")
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# 返回值类型
-# ═══════════════════════════════════════════════════════════════════════
 
 @dataclass
 class InsertResult:
@@ -72,70 +60,6 @@ class BatchResult:
         return self.success + self.failed
 
 
-def batch_insert(input_dir: str):
-    from tqdm import tqdm
-    from datetime import datetime
-
-def load_checkpoint(checkpoint_path: str) -> set[str]:
-    """从本地 JSON checkpoint 文件加载已上传的 doc_id 集合。"""
-    cp = Path(checkpoint_path)
-    if not cp.exists():
-        return set()
-    try:
-        with open(cp, encoding="utf-8") as f:
-            data = json.load(f)
-        doc_ids = set(data.get("doc_ids", []))
-        total = data.get("total_uploaded", len(doc_ids))
-        _log(f"[checkpoint] 加载 {cp.name}: {total} 个已上传文件")
-        return doc_ids
-    except (json.JSONDecodeError, KeyError) as e:
-        _log(f"[checkpoint] 警告: {cp.name} 损坏 ({e})，从头开始")
-        return set()
-
-
-def save_checkpoint(checkpoint_path: str, uploaded_doc_ids: set[str], collection_name: str = ""):
-    """原子写入 checkpoint 文件。"""
-    cp = Path(checkpoint_path)
-    data = {
-        "collection": collection_name,
-        "updated": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-        "total_uploaded": len(uploaded_doc_ids),
-        "doc_ids": sorted(uploaded_doc_ids),
-    }
-    cp.parent.mkdir(parents=True, exist_ok=True)
-    tmp = cp.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    tmp.replace(cp)
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# 模块级日志（不依赖类实例）
-# ═══════════════════════════════════════════════════════════════════════
-
-_log_file: str | None = None
-
-def _set_log_file(path: str):
-    global _log_file
-    _log_file = path
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-
-def _log(msg: str):
-    """模块级日志：同时写控制台(tqdm.write)和文件"""
-    ts = datetime.now().strftime("%H:%M:%S")
-    line = f"[{ts}] {msg}"
-    try:
-        from tqdm import tqdm as _tqdm
-        _tqdm.write(line)
-    except Exception:
-        print(line)
-    if _log_file:
-        try:
-            with open(_log_file, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-        except Exception:
-            pass
-
 # ═══════════════════════════════════════════════════════════════════════
 # MilvusImporter
 # ═══════════════════════════════════════════════════════════════════════
@@ -154,10 +78,9 @@ class MilvusImporter:
     def __init__(
         self,
         milvus_uri: str = DEFAULT_MILVUS_URI,
-        model_path: str = DEFAULT_MODEL_PATH,
         collection_name: str = DEFAULT_COLLECTION_NAME,
-        use_fp16: bool = True,
-        device: str | None = None,
+        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+        api_key: str | None = None,
         **chunk_kwargs,
     ):
         """
@@ -165,30 +88,25 @@ class MilvusImporter:
         ----------
         milvus_uri : str
             Milvus 服务地址。
-        model_path : str
-            BGE-M3 模型路径。
         collection_name : str
             Milvus collection 名称。
-        use_fp16 : bool
-            模型是否使用 fp16。
-        device : str | None
-            模型设备 ('cuda', 'cpu')。None 时自动选择。
+        embedding_model : str
+            千问 embedding 模型名称。
+        api_key : str | None
+            DashScope API Key。默认从环境变量 DASHSCOPE_API_KEY 读取。
         **chunk_kwargs :
             传递给 MarkdownChunker 的参数 (max_tokens, overlap, min_tokens 等)。
         """
         self.milvus_uri = milvus_uri
-        self.model_path = model_path
         self.collection_name = collection_name
+        self.embedding_model = embedding_model
+        self.api_key = api_key
         self._chunk_kwargs = chunk_kwargs
 
         # 延迟初始化（构造时不加载模型）
         self._client: MilvusClient | None = None
-        self._model: BGEM3FlagModel | None = None
+        self._model: EmbeddingClient | None = None
         self._chunker: MarkdownChunker | None = None
-
-        # 设备参数
-        self._use_fp16 = use_fp16
-        self._device = device
 
     # ── 属性（懒加载） ──
 
@@ -199,13 +117,13 @@ class MilvusImporter:
         return self._client
 
     @property
-    def model(self) -> BGEM3FlagModel:
+    def model(self) -> EmbeddingClient:
         if self._model is None:
-            _log(f"Loading BGE-M3 from {self.model_path} ...")
-            init_kwargs = {"use_fp16": self._use_fp16}
-            if self._device:
-                init_kwargs["devices"] = self._device
-            self._model = BGEM3FlagModel(self.model_path, **init_kwargs)
+            print(f"初始化千问 Embedding 客户端: {self.embedding_model} ...")
+            self._model = EmbeddingClient(
+                api_key=self.api_key,
+                model=self.embedding_model,
+            )
         return self._model
 
     @property
@@ -225,16 +143,16 @@ class MilvusImporter:
             为 True 时先删除旧 collection 再重建（schema 迁移时使用）。
         """
         if force_recreate and self.client.has_collection(collection_name=self.collection_name):
-            _log(f"删除旧 collection: {self.collection_name} (force_recreate=True)")
+            print(f"删除旧 collection: {self.collection_name} (force_recreate=True)")
             self.client.drop_collection(collection_name=self.collection_name)
 
         if self.client.has_collection(collection_name=self.collection_name):
-            _log(f"Collection 已存在: {self.collection_name}")
+            print(f"Collection 已存在: {self.collection_name}")
             return
 
-        # 创建新 collection
+        # 创建新 collection（纯 dense 检索，无稀疏向量）
         schema = self.client.create_schema(
-            description="Financial RAG with hybrid search (dense + sparse)",
+            description="Financial RAG with dense-only search (text-embedding-v4)",
             auto_id=False,
         )
         schema.add_field(field_name="chunk_id", datatype=DataType.VARCHAR, max_length=64, is_primary=True)
@@ -244,13 +162,13 @@ class MilvusImporter:
         schema.add_field(field_name="report_type", datatype=DataType.VARCHAR, max_length=64)
         schema.add_field(field_name="report_year", datatype=DataType.INT32)
         schema.add_field(field_name="report_date", datatype=DataType.VARCHAR, max_length=20)
+        schema.add_field(field_name="created_date", datatype=DataType.VARCHAR, max_length=20)
         schema.add_field(field_name="title", datatype=DataType.VARCHAR, max_length=1024)
         schema.add_field(field_name="title_path", datatype=DataType.VARCHAR, max_length=2048)
         schema.add_field(field_name="page_start", datatype=DataType.INT32)
         schema.add_field(field_name="page_end", datatype=DataType.INT32)
         schema.add_field(field_name="text", datatype=DataType.VARCHAR, max_length=65535)
         schema.add_field(field_name="embedding", datatype=DataType.FLOAT_VECTOR, dim=1024)
-        schema.add_field(field_name="sparse_embedding", datatype=DataType.SPARSE_FLOAT_VECTOR)
 
         index_params = self.client.prepare_index_params()
         index_params.add_index(
@@ -259,24 +177,19 @@ class MilvusImporter:
             index_type="HNSW",
             params={"M": 32, "efConstruction": 200},
         )
-        index_params.add_index(
-            field_name="sparse_embedding",
-            index_type="SPARSE_INVERTED_INDEX",
-            metric_type="IP",
-        )
 
         self.client.create_collection(
             collection_name=self.collection_name,
             schema=schema,
             index_params=index_params,
         )
-        _log(f"Collection 已创建: {self.collection_name}")
+        print(f"Collection 已创建: {self.collection_name}")
 
     def drop_collection(self):
         """删除 collection（危险操作）。"""
         if self.client.has_collection(collection_name=self.collection_name):
             self.client.drop_collection(collection_name=self.collection_name)
-            _log(f"Collection 已删除: {self.collection_name}")
+            print(f"Collection 已删除: {self.collection_name}")
 
     # ── 文件预处理（CPU：读 + 元数据 + 分块，不含嵌入） ──
 
@@ -330,10 +243,10 @@ class MilvusImporter:
 
         # token 安全截断：chunk.text 已含【章节】前缀（chunker 已 enrich）
         for chunk in chunks:
-            tl = len(self.model.tokenizer.encode(chunk.text, add_special_tokens=False))
+            tl = len(self.model.tokenizer.encode(chunk.text))
             if tl > self.TOKEN_SAFE_LIMIT:
-                chunk.text = self._safe_truncate_text(
-                    chunk.text, self.model.tokenizer, self.TOKEN_SAFE_LIMIT)
+                chunk.text = self.model.safe_truncate_text(
+                    chunk.text, self.TOKEN_SAFE_LIMIT)
 
         meta_dict = {
             "company_name": company_name,
@@ -346,20 +259,7 @@ class MilvusImporter:
 
     # ── 截断工具 ──
 
-    BGE_M3_MAX_LENGTH = 8192
     TOKEN_SAFE_LIMIT = 7500
-
-    @classmethod
-    def _safe_truncate_text(cls, text: str, tokenizer, limit: int) -> str:
-        """使用 tokenizer 内置 truncation（HuggingFace 标准方式）。"""
-        encoded = tokenizer(
-            text,
-            truncation=True,
-            max_length=limit,
-            add_special_tokens=True,
-            return_attention_mask=False,
-        )
-        return tokenizer.decode(encoded["input_ids"], skip_special_tokens=True)
 
     # ── 批量编码 + 插入（GPU） ──
 
@@ -367,15 +267,15 @@ class MilvusImporter:
         self,
         pending: list[tuple[str, dict, list]],
         *,
-        encode_batch_size: int = 128,
+        encode_batch_size: int = 10,
     ) -> list[InsertResult]:
-        """将多个文件的 chunks 合并，一次性 GPU 编码，然后按文件分别插入 Milvus。
+        """将多个文件的 chunks 合并，一次性 API 编码，然后按文件分别插入 Milvus。
 
         Parameters
         ----------
         pending : list of (doc_id, meta_dict, chunks)
         encode_batch_size : int
-            GPU 编码的内部 batch size（默认 128，充分利用 GPU）。
+            API 编码的内部 batch size（text-embedding-v4 上限为 10）。
 
         Returns
         -------
@@ -393,37 +293,26 @@ class MilvusImporter:
         if not all_chunks:
             return []
 
-        # 一次性 GPU 编码（token 截断已在 _prepare_file 中完成，此处不访问 tokenizer）
+        # 一次性 API 编码（token 截断已在 _prepare_file 中完成）
         texts = [c.text for c in all_chunks]
-        # 临时禁用 tqdm 抑制库内部进度条
-        _tqdm_old = os.environ.get("TQDM_DISABLE")
-        os.environ["TQDM_DISABLE"] = "1"
-        try:
-            output = self.model.encode(
-                texts,
-                batch_size=encode_batch_size,
-                return_dense=True,
-                return_sparse=True,
-            )
-        finally:
-            if _tqdm_old is None:
-                del os.environ["TQDM_DISABLE"]
-            else:
-                os.environ["TQDM_DISABLE"] = _tqdm_old
+        output = self.model.encode(
+            texts,
+            batch_size=encode_batch_size,
+            return_dense=True,
+        )
         vectors = output["dense_vecs"]
-        sparse_weights_list = output["lexical_weights"]
 
         # 按文件拆分，构建实体并插入
+        created_date_str = date.today().strftime("%Y-%m-%d")
         results = []
         start = 0
         for doc_id, meta, end in split_points:
             file_chunks = all_chunks[start:end]
             file_vectors = vectors[start:end]
-            file_sparse = sparse_weights_list[start:end]
             start = end
 
             entities = []
-            for chunk, vec, sw in zip(file_chunks, file_vectors, file_sparse):
+            for chunk, vec in zip(file_chunks, file_vectors):
                 entities.append({
                     "chunk_id": chunk.chunk_id,
                     "doc_id": chunk.doc_id,
@@ -432,13 +321,13 @@ class MilvusImporter:
                     "report_type": chunk.report_type,
                     "report_year": chunk.report_year,
                     "report_date": str(chunk.report_date),
+                    "created_date": created_date_str,
                     "title": (chunk.title or " > ".join(chunk.title_path))[:1020],
                     "title_path": (" > ".join(chunk.title_path))[:2040],
                     "page_start": chunk.page_start or -1,
                     "page_end": chunk.page_end or -1,
                     "text": chunk.text,
                     "embedding": vec.tolist(),
-                    "sparse_embedding": sw,
                 })
 
             # 幂等插入：先删旧数据（失败不阻塞），再插入（带重试）
@@ -492,7 +381,7 @@ class MilvusImporter:
             )
         except Exception as e:
             # GPU 批量编码失败 → 逐文件回退（不丢任何文件）
-            self._log(f"[回退] 批量GPU失败，逐文件处理 {len(pending_files)} 个文件: {type(e).__name__}")
+            print(f"[回退] 批量GPU失败，逐文件处理 {len(pending_files)} 个文件: {type(e).__name__}")
             batch_chunks = 0
             batch_success = 0
             for pf, (doc_id, meta, chunks) in zip(pending_files, pending):
@@ -518,8 +407,6 @@ class MilvusImporter:
                         "company_name": meta.get("company_name", "?"),
                     }
                     failed_entries.append(entry)
-            if skip_uploaded and batch_success > 0:
-                save_checkpoint(cp_path, uploaded, self.collection_name)
             return batch_chunks, batch_success
 
         # 逐文件处理结果（每个文件独立成功/失败）
@@ -548,11 +435,7 @@ class MilvusImporter:
                     "company_name": meta.get("company_name", "?"),
                 }
                 failed_entries.append(entry)
-                _log(f"  [失败-插入] {pf.name}: {type(exc).__name__}: {str(exc)[:100]}")
-
-        # 保存 checkpoint（只要 batch 中有成功文件就保存）
-        if skip_uploaded and batch_success > 0:
-            save_checkpoint(cp_path, uploaded, self.collection_name)
+                print(f"  [失败-插入] {pf.name}: {type(exc).__name__}: {str(exc)[:100]}")
 
         pbar.set_postfix_str(
             f"OK {pending_files[-1].name[:30]} [+{batch_success-1}]"
@@ -564,12 +447,12 @@ class MilvusImporter:
     def insert_one(self, file_path: str) -> InsertResult:
         """处理单个 md 文件：读取 → 元数据提取 → 分块 → 嵌入 → 插入。
 
-        对于批量导入，推荐使用 batch_insert() 以获得更好的 GPU 利用率。
+        对于批量导入，推荐使用 batch_insert() 以获得更好的 API 利用率。
         """
         doc_id, meta, chunks = self._prepare_file(file_path)
         results = self._encode_and_insert_batch(
             [(doc_id, meta, chunks)],
-            encode_batch_size=16,
+            encode_batch_size=10,
         )
         return results[0]
 
@@ -591,7 +474,7 @@ class MilvusImporter:
                     offset=offset,
                 )
             except Exception as e:
-                _log(f"[sync] Milvus 查询失败: {e}")
+                print(f"[sync] Milvus 查询失败: {e}")
                 break
 
             if not results:
@@ -604,8 +487,73 @@ class MilvusImporter:
                 break
             offset += batch_size
 
-        _log(f"[sync] Milvus 中现有 {len(uploaded)} 个唯一 doc_id")
+        print(f"[sync] Milvus 中现有 {len(uploaded)} 个唯一 doc_id")
         return uploaded
+
+    # ── 混合检索 ──
+
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        candidate_k: int = 100,
+        collection_name: str | None = None,
+        output_fields: list[str] | None = None,
+    ) -> list[dict]:
+        """Dense 检索（千问 text-embedding-v4），用于 RAG 查询。
+
+        Parameters
+        ----------
+        query : str
+            查询文本。
+        top_k : int
+            返回结果数量。
+        candidate_k : int
+            HNSW 检索的 ef 参数（候选池大小）。
+        collection_name : str | None
+            目标 collection，默认使用 self.collection_name。
+        output_fields : list[str] | None
+            需要返回的标量字段列表。
+
+        Returns
+        -------
+        list[dict]
+            每个 dict 包含 rank, score, doc_id, title, text_snippet。
+        """
+        if collection_name is None:
+            collection_name = self.collection_name
+        if output_fields is None:
+            output_fields = [
+                "text", "chunk_id", "doc_id", "title",
+            ]
+
+        # 编码查询
+        output = self.model.encode([query])
+        dense_vec = output["dense_vecs"][0].tolist()
+
+        results = self._retry_milvus(
+            self.client.search,
+            collection_name=collection_name,
+            data=[dense_vec],
+            anns_field="embedding",
+            search_params={"metric_type": "COSINE", "params": {"ef": candidate_k}},
+            limit=top_k,
+            output_fields=output_fields,
+        )
+
+        res = []
+        if results:
+            for rank, hit in enumerate(results[0], 1):
+                e = hit.get("entity", {})
+                res.append({
+                    "rank": rank,
+                    "score": hit["distance"],
+                    "doc_id": e.get("doc_id"),
+                    "title": e.get("title"),
+                    "text_snippet": e.get("text", ""),
+                })
+
+        return res
 
     # ── 批量导入 ──
 
@@ -618,12 +566,12 @@ class MilvusImporter:
         retry_from_log: str | None = None,
         sync_checkpoint: bool = False,
         accumulate_files: int = 5,
-        encode_batch_size: int = 64,
+        encode_batch_size: int = 10,
     ) -> BatchResult:
         """批量导入 md 文件到 Milvus。
 
-        采用批量累积策略：先对多个文件做 CPU 分块，然后一次性 GPU 编码，
-        大幅提升 GPU 利用率和整体吞吐量。
+        采用批量累积策略：先对多个文件做 CPU 分块，然后一次性 API 编码，
+        大幅提升 API 利用率和整体吞吐量。
 
         Parameters
         ----------
@@ -638,9 +586,9 @@ class MilvusImporter:
         sync_checkpoint : bool
             是否从 Milvus 查询来校准本地 checkpoint。
         accumulate_files : int
-            累积多少个文件后做一次 GPU 编码（默认 20）。
+            累积多少个文件后做一次 API 编码（默认 5）。
         encode_batch_size : int
-            GPU 编码的内部 batch size（默认 128）。
+            API 编码的内部 batch size（默认 10，text-embedding-v4 上限）。
 
         Returns
         -------
@@ -653,7 +601,7 @@ class MilvusImporter:
         total = len(md_files)
 
         if total == 0:
-            _log(f"[警告] {input_dir} 中没有 .md 文件")
+            print(f"[警告] {input_dir} 中没有 .md 文件")
             return BatchResult()
 
         # ── checkpoint 路径 ──
@@ -663,40 +611,14 @@ class MilvusImporter:
         if retry_from_log:
             retry_path = Path(retry_from_log)
             if not retry_path.exists():
-                _log(f"[错误] 失败日志不存在: {retry_from_log}")
+                print(f"[错误] 失败日志不存在: {retry_from_log}")
                 return BatchResult()
             with open(retry_path, encoding="utf-8") as f:
                 failed_entries = [json.loads(line) for line in f if line.strip()]
             retry_names = {entry["file"].replace(".md", "") for entry in failed_entries}
             md_files = [f for f in md_files if f.stem in retry_names]
-            _log(f"[重试] 从 {retry_path.name} 加载 {len(failed_entries)} 条记录, "
+            print(f"[重试] 从 {retry_path.name} 加载 {len(failed_entries)} 条记录, "
                   f"匹配到 {len(md_files)} 个文件")
-
-        # ── 加载 checkpoint ──
-        uploaded: set[str] = set()
-        if skip_uploaded:
-            uploaded = load_checkpoint(cp_path)
-            if sync_checkpoint:
-                milvus_ids = self.get_uploaded_doc_ids()
-                missing = milvus_ids - uploaded
-                if missing:
-                    _log(f"[sync] 本地 checkpoint 缺少 {len(missing)} 个文件，已补齐")
-                    uploaded |= milvus_ids
-                extra = uploaded - milvus_ids
-                if extra:
-                    _log(f"[sync] 本地 checkpoint 多出 {len(extra)} 个文件 (Milvus 中不存在)")
-
-        # ── 过滤已上传 ──
-        skipped = 0
-        to_process = []
-        for f in md_files:
-            if f.stem in uploaded:
-                skipped += 1
-            else:
-                to_process.append(f)
-
-        if skipped:
-            _log(f"[跳过] {skipped} 个已在 checkpoint, 待处理 {len(to_process)} 个")
 
         # ── 顺序批量累积：CPU 分块攒够一批 → GPU 编码+插入 → 下一批 ──
         failed_entries: list[dict] = []
@@ -705,7 +627,7 @@ class MilvusImporter:
         pending: list[tuple[str, dict, list]] = []
         pending_files: list[Path] = []
 
-        pbar = tqdm(to_process, desc="导入进度", unit="file",
+        pbar = tqdm(md_files, desc="导入进度", unit="file",
                     bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} "
                                "[{elapsed}<{remaining}, {rate_fmt}]")
 
@@ -735,13 +657,13 @@ class MilvusImporter:
                     "stock_code": stock, "company_name": company,
                 }
                 failed_entries.append(entry)
-                _log(f"  [失败-分块] {fname}: {err_type}: {err_msg[:100]}")
+                print(f"  [失败-分块] {fname}: {err_type}: {err_msg[:100]}")
                 continue
 
             # 攒够一批：GPU 编码 + 插入
             if len(pending) >= accumulate_files:
                 b_chunks, b_success = self._flush_pending(
-                    pending, pending_files, uploaded, cp_path,
+                    pending, pending_files, cp_path,
                     skip_uploaded, encode_batch_size, failed_entries, pbar,
                 )
                 total_chunks += b_chunks
@@ -753,7 +675,7 @@ class MilvusImporter:
         # 尾批
         if pending:
             b_chunks, b_success = self._flush_pending(
-                pending, pending_files, uploaded, cp_path,
+                pending, pending_files, cp_path,
                 skip_uploaded, encode_batch_size, failed_entries, pbar,
             )
             total_chunks += b_chunks
@@ -762,41 +684,12 @@ class MilvusImporter:
 
         pbar.close()
 
-        # ── 最终保存 checkpoint ──
-        if skip_uploaded and success > 0:
-            save_checkpoint(cp_path, uploaded, self.collection_name)
-
-        # ── 失败日志 ──
-        failed_log = ""
-        if failed_entries:
-            log_path = input_dir_obj / f"failed_import_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
-            with open(log_path, "w", encoding="utf-8") as log:
-                for entry in failed_entries:
-                    log.write(json.dumps(entry, ensure_ascii=False) + "\n")
-            failed_log = str(log_path)
-
-        # ── 汇总 ──
-        _log(f"\n{'='*55}")
-        _log(f"导入完成: {success}/{len(to_process)} 成功 "
-              f"(总计 {skipped + success}/{total} 已处理), 共 {total_chunks} 个 chunks")
-        if skipped:
-            _log(f"跳过: {skipped} 个已上传")
-        if failed_entries:
-            _log(f"失败: {len(failed_entries)} 个")
-            _log(f"失败日志: {failed_log}")
-            for entry in failed_entries:
-                _log(f"  - [{entry['error_type']}] {entry['file']}")
-            _log(f"\n重试: importer.batch_insert('{input_dir}', retry_from_log='{Path(failed_log).name}')")
-        _log(f"Checkpoint: {cp_path}")
-
         return BatchResult(
             total_files=total,
             success=success,
-            skipped=skipped,
             failed=len(failed_entries),
             total_chunks=total_chunks,
             failed_entries=failed_entries,
-            failed_log_path=failed_log,
             checkpoint_path=cp_path,
         )
 
@@ -893,22 +786,14 @@ def main(argv: list[str] | None = None):
         "--collection", default=DEFAULT_COLLECTION_NAME,
         help=f"Collection 名称 (默认: {DEFAULT_COLLECTION_NAME})",
     )
-    parser.add_argument(
-        "--device", default=None,
-        help="模型设备: cuda 或 cpu (默认: 自动)",
-    )
 
     args = parser.parse_args(argv)
 
     importer = MilvusImporter(
         milvus_uri=args.uri,
         collection_name=args.collection,
-        device=args.device,
     )
     importer.ensure_collection(force_recreate=args.force_recreate)
-
-    _set_log_file(str(Path(args.input_dir) / f"import_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"))
-
     result = importer.batch_insert(
         input_dir=args.input_dir,
         skip_uploaded=not args.no_skip,

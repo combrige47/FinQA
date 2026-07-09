@@ -38,6 +38,22 @@ def _get_db() -> MySQLClient:
     """创建新的 MySQL 连接。"""
     return MySQLClient()
 
+def get_collection_name_by_kb_id(kb_id:int):
+    db = _get_db()
+    try:
+        sql = """
+                        SELECT milvus_collection_name 
+                        FROM fp_knowledge_base 
+                        WHERE id = %s
+                    """
+        db.execute(sql, [kb_id])
+        row = db.fetchone()
+        if row:
+            return row[0]
+    except Exception as e:
+        return None
+    finally:
+        db.close()
 
 # ═══════════════════════════════════════════════════════════════════════
 # KB CRUD（使用 fp_knowledge_base 表）
@@ -88,7 +104,7 @@ def create_kb(
         db.commit()
         kb_id = db.cursor.lastrowid
 
-        milvus_collection = _get_db().get_collection_name_by_kb_id(kb_id)
+        milvus_collection = get_collection_name_by_kb_id(kb_id)
 
         # 更新 milvus_collection_name
         db.execute(
@@ -208,9 +224,9 @@ def _ensure_user_kb_collection(kb_id: int, importer) -> str:
 
     简化 schema:
       chunk_id (PK), doc_id, title, title_path, text,
-      embedding (1024-d FLOAT_VECTOR), sparse_embedding (SPARSE_FLOAT_VECTOR)
+      created_date, embedding (1024-d FLOAT_VECTOR)
     """
-    collection_name = _get_db().get_collection_name_by_kb_id(kb_id)
+    collection_name = get_collection_name_by_kb_id(kb_id)
 
     if importer.client.has_collection(collection_name=collection_name):
         return collection_name
@@ -224,8 +240,8 @@ def _ensure_user_kb_collection(kb_id: int, importer) -> str:
     schema.add_field(field_name="title", datatype=DataType.VARCHAR, max_length=1024)
     schema.add_field(field_name="title_path", datatype=DataType.VARCHAR, max_length=2048)
     schema.add_field(field_name="text", datatype=DataType.VARCHAR, max_length=65535)
+    schema.add_field(field_name="created_date", datatype=DataType.VARCHAR, max_length=20)
     schema.add_field(field_name="embedding", datatype=DataType.FLOAT_VECTOR, dim=1024)
-    schema.add_field(field_name="sparse_embedding", datatype=DataType.SPARSE_FLOAT_VECTOR)
 
     index_params = importer.client.prepare_index_params()
     index_params.add_index(
@@ -233,11 +249,6 @@ def _ensure_user_kb_collection(kb_id: int, importer) -> str:
         metric_type="COSINE",
         index_type="HNSW",
         params={"M": 32, "efConstruction": 200},
-    )
-    index_params.add_index(
-        field_name="sparse_embedding",
-        index_type="SPARSE_INVERTED_INDEX",
-        metric_type="IP",
     )
 
     importer.client.create_collection(
@@ -251,7 +262,7 @@ def _ensure_user_kb_collection(kb_id: int, importer) -> str:
 
 def _drop_user_kb_collection(kb_id: int, importer) -> None:
     """删除用户 KB 对应的 Milvus collection。"""
-    collection_name = _get_db().get_collection_name_by_kb_id(kb_id)
+    collection_name = get_collection_name_by_kb_id(kb_id)
     try:
         if importer.client.has_collection(collection_name=collection_name):
             importer.client.drop_collection(collection_name=collection_name)
@@ -300,7 +311,7 @@ def upload_to_kb(
     doc_id = f"kb_{kb_id}_{uuid.uuid4().hex[:12]}"
     file_type = ext.lstrip(".")
     title = Path(original_filename).stem  # 文件名（不含扩展名）作为标题
-    collection_name = _get_db().get_collection_name_by_kb_id(kb_id)
+    collection_name = get_collection_name_by_kb_id(kb_id)
     doc_record_id = None  # 初始化，用于异常处理
 
     # ── ③ 保存临时文件 ──
@@ -327,10 +338,10 @@ def upload_to_kb(
             db.execute(
                 """INSERT INTO fp_document
                    (chunk_count, content, file_path, file_size, format,
-                    original_file_name, status, title, knowledge_base_id, uploader_id)
-                   VALUES (0, %s, %s, %s, %s, %s, 'processing', %s, %s, %s)""",
+                    milvus_doc_id, original_file_name, status, title, knowledge_base_id, uploader_id)
+                   VALUES (0, %s, %s, %s, %s, %s, %s, 'processing', %s, %s, %s)""",
                 (markdown_text, str(temp_path), len(file_bytes), file_type,
-                 original_filename, title, kb_id, uploader_id),
+                 doc_id, original_filename, title, kb_id, uploader_id),
             )
             db.commit()
             doc_record_id = db.cursor.lastrowid
@@ -353,35 +364,30 @@ def upload_to_kb(
 
         # ── ⑦ token 安全截断 ──
         for chunk in chunks:
-            tl = len(importer.model.tokenizer.encode(chunk.text, add_special_tokens=False))
+            tl = len(importer.model.tokenizer.encode(chunk.text))
             if tl > 7500:
-                chunk.text = _safe_truncate_text(chunk.text, importer.model.tokenizer, 7500)
+                chunk.text = importer.model.safe_truncate_text(chunk.text, 7500)
 
         # ── ⑧ 编码 ──
         texts = [c.text for c in chunks]
-        output = importer.model.encode(
-            texts,
-            batch_size=64,
-            return_dense=True,
-            return_sparse=True,
-        )
+        output = importer.model.encode(texts)
         dense_vecs = output["dense_vecs"]
-        sparse_weights = output["lexical_weights"]
 
         # ── ⑨ 确保 collection 存在 ──
         _ensure_user_kb_collection(kb_id, importer)
 
         # ── ⑩ 构建简化 entity 并插入 Milvus ──
+        created_date_str = date.today().strftime("%Y-%m-%d")
         entities = []
-        for chunk, dv, sw in zip(chunks, dense_vecs, sparse_weights):
+        for chunk, dv in zip(chunks, dense_vecs):
             entities.append({
                 "chunk_id": chunk.chunk_id,
                 "doc_id": chunk.doc_id,
                 "title": chunk.title or title,
                 "title_path": " > ".join(chunk.title_path) if chunk.title_path else "",
                 "text": chunk.text,
+                "created_date": created_date_str,
                 "embedding": dv.tolist(),
-                "sparse_embedding": sw,
             })
 
         _insert_with_retry(importer, collection_name, doc_id, entities)
@@ -419,10 +425,6 @@ def upload_to_kb(
     except Exception as e:
         _mark_document_failed(doc_record_id, str(e))
         raise
-
-    finally:
-        # ── ⑫ 清理临时文件 ──
-        _cleanup_temp(str(temp_path), upload_dir)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -490,8 +492,12 @@ def _convert_to_markdown(file_path: str, filename: str, file_type: str) -> str:
 
 
 def _safe_truncate_text(text: str, tokenizer, limit: int) -> str:
-    """使用 tokenizer 内置截断安全截断文本。"""
-    encoded = tokenizer(text, truncation=True, max_length=limit, return_tensors=None)
+    """使用 tokenizer 内置截断安全截断文本。
+
+    注意：此函数已废弃，推荐使用 importer.model.safe_truncate_text()。
+    保留仅用于向后兼容。
+    """
+    encoded = tokenizer(text, truncation=True, max_length=limit)
     return tokenizer.decode(encoded["input_ids"], skip_special_tokens=True)
 
 
@@ -547,7 +553,7 @@ def list_documents(kb_id: int, creator_id: int) -> list[dict]:
         db.execute(
             """SELECT id, chunk_count, content, created_at, file_path, file_size,
                       format, original_file_name, status, summary, title, updated_at,
-                      knowledge_base_id, uploader_id
+                      knowledge_base_id, uploader_id, milvus_doc_id
                FROM fp_document
                WHERE knowledge_base_id = %s
                ORDER BY created_at DESC""",
@@ -565,33 +571,41 @@ def delete_document(kb_id: int, doc_id: int, creator_id: int, importer) -> dict:
     if not kb:
         raise NotFoundError(f"知识库 {kb_id} 不存在或无权访问")
 
-    collection_name = _get_db().get_collection_name_by_kb_id(kb_id)
+    collection_name = get_collection_name_by_kb_id(kb_id)
 
     db = _get_db()
     try:
-        # 先查文档记录
+        # 先查文档记录（含 milvus_doc_id）
         db.execute(
-            "SELECT id, chunk_count, file_path FROM fp_document WHERE id = %s AND knowledge_base_id = %s",
+            "SELECT id, chunk_count, file_path, milvus_doc_id FROM fp_document WHERE id = %s AND knowledge_base_id = %s",
             (doc_id, kb_id),
         )
         doc_row = db.fetchone()
         if not doc_row:
             raise NotFoundError(f"文档 {doc_id} 不存在")
-        if doc_row[2]:
-            # 从文件路径提取 Milvus doc_id（格式: uploads/{kb_id}/kb_{kb_id}_{uuid}_filename）
-            milvus_doc_id = _extract_doc_id_from_path(doc_row[2])
-            if milvus_doc_id:
-                try:
-                    importer.client.delete(
-                        collection_name=collection_name,
-                        filter=f'doc_id == "{milvus_doc_id}"',
-                    )
-                except Exception as e:
-                    logger.warning(f"Milvus 删除失败: {e}")
 
         chunk_count = doc_row[1]
+        file_path = doc_row[2]
+        milvus_doc_id = doc_row[3] or _extract_doc_id_from_path(file_path)
 
-        # 删除 MySQL 记录
+        # ① 删除 Milvus 中的 chunks
+        if milvus_doc_id:
+            try:
+                importer.client.delete(
+                    collection_name=collection_name,
+                    filter=f'doc_id == "{milvus_doc_id}"',
+                )
+            except Exception as e:
+                logger.warning(f"Milvus 删除失败: {e}")
+
+        # ② 删除磁盘上的 md 文件
+        if file_path and os.path.isfile(file_path):
+            try:
+                os.remove(file_path)
+            except Exception as e:
+                logger.warning(f"文件删除失败: {file_path}, {e}")
+
+        # ③ 删除 MySQL 记录
         db.execute("DELETE FROM fp_document WHERE id = %s", (doc_id,))
         if chunk_count > 0:
             db.execute(
@@ -622,7 +636,7 @@ def _row_to_doc_dict(row) -> dict:
     """fp_document row → dict。
     Columns: id, chunk_count, content, created_at, file_path, file_size,
              format, original_file_name, status, summary, title, updated_at,
-             knowledge_base_id, uploader_id
+             knowledge_base_id, uploader_id, milvus_doc_id
     """
     def _fmt(v):
         if isinstance(v, datetime):
@@ -644,7 +658,57 @@ def _row_to_doc_dict(row) -> dict:
         "updated_at": _fmt(row[11]),
         "knowledge_base_id": row[12],
         "uploader_id": row[13],
+        "milvus_doc_id": row[14] or "",
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# doc_id → 原文召回
+# ═══════════════════════════════════════════════════════════════════════
+
+def get_document_by_milvus_doc_id(kb_id: int, milvus_doc_id: str, creator_id: int) -> dict | None:
+    """通过 Milvus doc_id 反查文档。
+
+    使用场景：Milvus 混合检索返回 doc_id 后，调用此函数获取完整文档内容。
+
+    Returns
+    -------
+    dict 或 None
+        包含完整 metadata + content（全文），文档不存在或无权访问时返回 None。
+    """
+    kb = get_kb(kb_id, creator_id)
+    if not kb:
+        return None
+
+    db = _get_db()
+    try:
+        db.execute(
+            """SELECT id, chunk_count, content, created_at, file_path, file_size,
+                      format, original_file_name, status, title, updated_at,
+                      knowledge_base_id, uploader_id, milvus_doc_id
+               FROM fp_document
+               WHERE knowledge_base_id = %s AND milvus_doc_id = %s""",
+            (kb_id, milvus_doc_id),
+        )
+        row = db.fetchone()
+        if not row:
+            return None
+
+        # 如果 DB 中 content 为空，尝试从文件读取
+        content = row[2]
+        file_path = row[4]
+        if not content and file_path and os.path.isfile(file_path):
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except Exception:
+                pass
+
+        result = _row_to_doc_dict(row)
+        result["content"] = content or ""  # 全文，不走 preview 截断
+        return result
+    finally:
+        db.close()
 
 
 # ═══════════════════════════════════════════════════════════════════════
