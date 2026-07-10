@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# IDE
+.idea/
+
+# Data & Output
+know/
+open_output/
+output/
+output.zip
+*.pdf
+test.md
+
+# Model files
+model/
+
+# Data files in vector/
+vector/*.md
+vector/*.pdf
