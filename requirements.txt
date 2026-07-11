@@ -28,7 +28,7 @@ pymysql>=1.1.0
 
 # ── PDF 转换 ──
 opendataloader-pdf               # parse/pdf2md.py 使用
-docling>=2.0.0                   # tools/mineru_use.py 使用（可选）
+# docling>=2.0.0                   # tools/mineru_use.py 使用（可选）
 
 # ── 股票数据获取（可选） ──
 akshare>=1.14.0

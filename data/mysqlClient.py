@@ -4,7 +4,7 @@ class MySQLClient:
 
     def __init__(self):
         self.conn = pymysql.connect(
-            host="124.70.51.221",
+            host="localhost",
             port=3306,
             user="kang",
             password="123456",

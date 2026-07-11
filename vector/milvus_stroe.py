@@ -28,7 +28,7 @@ from parse.parse_name import extract_report_meta
 from vector.embedding_client import EmbeddingClient
 
 # ── 默认配置 ──
-DEFAULT_MILVUS_URI = "http://124.70.51.221:19530"
+DEFAULT_MILVUS_URI = "http://localhost:19530"
 DEFAULT_COLLECTION_NAME = "financial_chunk"
 DEFAULT_INPUT_DIR = "open_output"
 DEFAULT_EMBEDDING_MODEL = "text-embedding-v4"

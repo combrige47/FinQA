@@ -19,3 +19,6 @@ model/
 # Data files in vector/
 vector/*.md
 vector/*.pdf
+
+# Upload file uploads/
+uploads/

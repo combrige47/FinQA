@@ -10,6 +10,7 @@ from fastapi import FastAPI, Query, File, UploadFile, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
+from schedule import start_scheduler, scheduler
 
 # 确保项目根目录在 sys.path 中，以便导入 sibling package
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -85,12 +86,14 @@ async def lifespan(app: FastAPI):
         print(f"警告: 默认集合 {DEFAULT_COLLECTION} 不存在，/search 和 /query 需指定 kb_id")
     # 预热客户端（验证 API Key 可用）
     _ = importer.model
+    start_scheduler()
     print("=== 资源加载完成，服务就绪 ===")
 
     yield
 
     print("=== 服务关闭，释放资源 ===")
     importer.close()
+    scheduler.shutdown()
 
 
 app = FastAPI(title="FinQA Dense Retriever Service", lifespan=lifespan)

@@ -432,14 +432,11 @@ def upload_to_kb(
 # ═══════════════════════════════════════════════════════════════════════
 
 def _insert_with_retry(importer, collection_name: str, doc_id: str, entities: list[dict]) -> None:
-    """幂等插入：先删除同 doc_id 数据，再插入，失败自动重试。"""
+    """幂等插入：插入，失败自动重试。"""
+    importer.client.load_collection(collection_name)
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            importer.client.delete(
-                collection_name=collection_name,
-                filter=f'doc_id == "{doc_id}"',
-            )
             importer.client.insert(
                 collection_name=collection_name,
                 data=entities,
